@@ -1,13 +1,26 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>SAMURAI JUMP</title>
+    
+    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Sawarabi+Mincho&display=swap" rel="stylesheet">
+
+    <!-- React & ReactDOM (UMD) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel Standalone (for compiling JSX/TS in browser) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
     <style>
-      @import url('https://fonts.googleapis.com/css2?family=Sawarabi+Mincho&display=swap');
-      
       body {
         margin: 0;
         padding: 0;
@@ -15,6 +28,7 @@
         background-color: #f5f5f4; /* stone-100 */
         touch-action: none;
         font-family: 'Sawarabi Mincho', serif;
+        -webkit-font-smoothing: antialiased;
       }
       
       /* Custom scrollbar hide */
@@ -24,6 +38,15 @@
 
       .font-samurai {
         font-family: 'Sawarabi Mincho', serif;
+      }
+      
+      /* Animations */
+      @keyframes fadeIn {
+        from { opacity: 0; transform: scale(0.95); }
+        to { opacity: 1; transform: scale(1); }
+      }
+      .animate-fade-in {
+        animation: fadeIn 0.5s ease-out forwards;
       }
     </style>
   <script type="importmap">
@@ -38,6 +61,902 @@
 </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="./index.tsx"></script>
+
+    <!-- Main Application Script -->
+    <script type="text/babel" data-presets="react,typescript">
+      const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+      // --- TYPES & CONSTANTS ---
+
+      enum GameState {
+        START = 'START',
+        PLAYING = 'PLAYING',
+        GAME_OVER = 'GAME_OVER'
+      }
+
+      const CONFIG = {
+        gravity: 0.6,
+        jumpStrength: 13,
+        groundHeight: 120,
+        baseSpeed: 5,
+        starDuration: 15000, // 15 seconds
+      };
+
+      const THEME = {
+        day: {
+          background: '#f5f5f4', // stone-100
+          ground: '#1c1917', // stone-900
+          player: '#1c1917', // stone-900
+          playerInvincible: '#d97706', // amber-600
+          obstacleGround: '#1c1917', // stone-900
+          obstacleAir: '#7f1d1d', // red-900
+          sun: '#ef4444', // red-500
+          moon: 'transparent', 
+          text: '#1c1917',
+          accent: '#ef4444'
+        },
+        night: {
+          background: '#09090b', // zinc-950
+          ground: '#e5e5e5', // neutral-200
+          player: '#e5e5e5', // neutral-200
+          playerInvincible: '#fbbf24', // amber-400
+          obstacleGround: '#e5e5e5', // neutral-200
+          obstacleAir: '#f87171', // red-400
+          sun: 'transparent', 
+          moon: '#fef3c7', // amber-100
+          text: '#e5e5e5',
+          accent: '#f87171'
+        }
+      };
+
+      const COLORS = {
+        star: '#fbbf24',
+        ...THEME.day
+      };
+
+      const PLAYER_DIMS = {
+        width: 30,
+        height: 60,
+        headRadius: 8,
+      };
+
+      // --- UTILS: COLOR ---
+
+      const colorCache = {};
+
+      function hexToRgb(hex) {
+        if (!hex || hex === 'transparent') return [0, 0, 0];
+        if (colorCache[hex]) return colorCache[hex];
+        
+        const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+        const rgb = result
+          ? [
+              parseInt(result[1], 16),
+              parseInt(result[2], 16),
+              parseInt(result[3], 16),
+            ]
+          : [0, 0, 0];
+          
+        colorCache[hex] = rgb;
+        return rgb;
+      }
+
+      function lerpColor(c1, c2, t) {
+        if (c1 === 'transparent' || c2 === 'transparent') return t < 0.5 ? c1 : c2;
+        
+        const [r1, g1, b1] = hexToRgb(c1);
+        const [r2, g2, b2] = hexToRgb(c2);
+        
+        const cl = Math.max(0, Math.min(1, t));
+
+        const r = Math.round(r1 + (r2 - r1) * cl);
+        const g = Math.round(g1 + (g2 - g1) * cl);
+        const b = Math.round(b1 + (b2 - b1) * cl);
+
+        return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
+      }
+
+      // --- UTILS: AUDIO ---
+
+      class SoundManager {
+        constructor() {
+          this.ctx = null;
+          try {
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (AudioContextClass) {
+              this.ctx = new AudioContextClass();
+            }
+          } catch (e) {
+            console.error("AudioContext not supported", e);
+          }
+        }
+
+        ensureContext() {
+          if (this.ctx && this.ctx.state === 'suspended') {
+            this.ctx.resume();
+          }
+        }
+
+        playJump() {
+          if (!this.ctx) return;
+          this.ensureContext();
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(200, this.ctx.currentTime);
+          osc.frequency.exponentialRampToValueAtTime(600, this.ctx.currentTime + 0.15);
+
+          gain.gain.setValueAtTime(0.3, this.ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.15);
+
+          osc.connect(gain);
+          gain.connect(this.ctx.destination);
+
+          osc.start();
+          osc.stop(this.ctx.currentTime + 0.2);
+        }
+
+        playCollect() {
+          if (!this.ctx) return;
+          this.ensureContext();
+          const now = this.ctx.currentTime;
+          const createNote = (freq, startTime) => {
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0.2, startTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, startTime + 0.3);
+            osc.connect(gain);
+            gain.connect(this.ctx.destination);
+            osc.start(startTime);
+            osc.stop(startTime + 0.3);
+          };
+          createNote(880, now); // A5
+          createNote(1108, now + 0.1); // C#6
+          createNote(1318, now + 0.2); // E6
+        }
+
+        playCrash() {
+          if (!this.ctx) return;
+          this.ensureContext();
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(100, this.ctx.currentTime);
+          osc.frequency.exponentialRampToValueAtTime(20, this.ctx.currentTime + 0.3);
+          gain.gain.setValueAtTime(0.4, this.ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.3);
+          osc.connect(gain);
+          gain.connect(this.ctx.destination);
+          osc.start();
+          osc.stop(this.ctx.currentTime + 0.4);
+        }
+      }
+      const audioManager = new SoundManager();
+
+      // --- COMPONENT: GAME CANVAS ---
+
+      const GameCanvas = ({
+        gameState,
+        setGameState,
+        setScore,
+        setIsInvincible,
+        isInvincible,
+        triggerJump,
+        onJumpHandled,
+      }) => {
+        const canvasRef = useRef(null);
+        const requestRef = useRef(0);
+        
+        // Game Loop State Refs
+        const frameCountRef = useRef(0);
+        const scoreRef = useRef(0);
+        const speedRef = useRef(CONFIG.baseSpeed);
+        const obstaclesRef = useRef([]);
+        const starsRef = useRef([]);
+        const particlesRef = useRef([]);
+        const invincibilityEndTimeRef = useRef(0);
+        
+        // Player Physics Refs
+        const playerYRef = useRef(0);
+        const playerDyRef = useRef(0);
+        const isJumpingRef = useRef(false);
+        const groundYRef = useRef(0);
+
+        // Cycle Logic
+        const getCurrentTheme = useCallback((score) => {
+          const cycleLength = 60;
+          const transitionDuration = 5;
+          
+          const cycleIndex = Math.floor(score / cycleLength);
+          const isNightTarget = cycleIndex % 2 !== 0; 
+          const timeInCycle = score % cycleLength;
+
+          let t = 0; 
+
+          // Skip transition on Cycle 0 (Game Start)
+          if (cycleIndex === 0) {
+              t = 0;
+          } else if (timeInCycle < transitionDuration) {
+              const progress = timeInCycle / transitionDuration;
+              t = isNightTarget ? progress : 1 - progress;
+          } else {
+              t = isNightTarget ? 1 : 0;
+          }
+
+          if (t <= 0.01) return { colors: THEME.day, t: 0 };
+          if (t >= 0.99) return { colors: THEME.night, t: 1 };
+
+          return {
+            colors: {
+              background: lerpColor(THEME.day.background, THEME.night.background, t),
+              ground: lerpColor(THEME.day.ground, THEME.night.ground, t),
+              player: lerpColor(THEME.day.player, THEME.night.player, t),
+              playerInvincible: lerpColor(THEME.day.playerInvincible, THEME.night.playerInvincible, t),
+              obstacleGround: lerpColor(THEME.day.obstacleGround, THEME.night.obstacleGround, t),
+              obstacleAir: lerpColor(THEME.day.obstacleAir, THEME.night.obstacleAir, t),
+              sun: THEME.day.sun,
+              moon: THEME.night.moon,
+              text: lerpColor(THEME.day.text, THEME.night.text, t),
+              accent: lerpColor(THEME.day.accent, THEME.night.accent, t),
+            },
+            t: t
+          };
+        }, []);
+
+        const resetGame = useCallback(() => {
+          scoreRef.current = 0;
+          speedRef.current = CONFIG.baseSpeed;
+          obstaclesRef.current = [];
+          starsRef.current = [];
+          particlesRef.current = [];
+          playerDyRef.current = 0;
+          isJumpingRef.current = false;
+          invincibilityEndTimeRef.current = 0;
+          setScore(0);
+          setIsInvincible(false);
+          frameCountRef.current = 0;
+          
+          obstaclesRef.current.push({
+            id: Date.now(),
+            x: window.innerWidth + 600,
+            y: 0, 
+            width: 40,
+            height: 40,
+            passed: false,
+            type: 'GROUND'
+          });
+        }, [setScore, setIsInvincible]);
+
+        const performJump = useCallback(() => {
+          if (!isJumpingRef.current) {
+            playerDyRef.current = -CONFIG.jumpStrength;
+            isJumpingRef.current = true;
+            audioManager.playJump();
+            
+            const canvas = canvasRef.current;
+            if (canvas) {
+               const { colors } = getCurrentTheme(scoreRef.current);
+               const px = 100; 
+               const py = groundYRef.current;
+               for (let i = 0; i < 8; i++) {
+                 particlesRef.current.push({
+                   x: px + (Math.random() - 0.5) * 20,
+                   y: py,
+                   vx: (Math.random() - 0.5) * 4,
+                   vy: -(Math.random() * 3),
+                   life: 1.0,
+                   color: colors.player,
+                   size: Math.random() * 4 + 2
+                 });
+               }
+            }
+          }
+        }, [getCurrentTheme]);
+
+        useEffect(() => {
+          if (triggerJump && gameState === GameState.PLAYING) {
+            performJump();
+            onJumpHandled();
+          }
+        }, [triggerJump, gameState, performJump, onJumpHandled]);
+
+        useEffect(() => {
+          if (gameState === GameState.START) {
+              resetGame();
+              const canvas = canvasRef.current;
+              if (canvas) {
+                   const ctx = canvas.getContext('2d');
+                   if(ctx) {
+                       // Initialize dimensions
+                       canvas.width = window.innerWidth;
+                       canvas.height = window.innerHeight;
+                       groundYRef.current = canvas.height - CONFIG.groundHeight;
+                       drawGame(ctx, canvas.width, canvas.height, true);
+                   }
+              }
+          }
+        }, [gameState, resetGame]);
+
+        const spawnObstacle = (canvasWidth) => {
+          const time = scoreRef.current;
+          let minGapBase = 350;
+          let spawnChance = 0.015;
+
+          if (time > 60) {
+              minGapBase = 200;
+              spawnChance = 0.04;
+          } else if (time > 40) {
+              minGapBase = 250;
+              spawnChance = 0.03;
+          } else if (time > 20) {
+              minGapBase = 300;
+              spawnChance = 0.02;
+          }
+
+          const minGap = minGapBase + (speedRef.current * 15); 
+          const lastObstacle = obstaclesRef.current[obstaclesRef.current.length - 1];
+          
+          if (!lastObstacle || (canvasWidth - lastObstacle.x > minGap)) {
+            if (Math.random() < spawnChance) {
+               let type = 'GROUND';
+               if (time > 40 && Math.random() > 0.6) {
+                   type = 'AIR';
+               }
+               const size = type === 'AIR' ? 50 : (30 + Math.random() * 40);
+               
+               obstaclesRef.current.push({
+                 id: Date.now() + Math.random(),
+                 x: canvasWidth + 50,
+                 y: 0,
+                 width: size,
+                 height: size,
+                 passed: false,
+                 type: type
+               });
+            }
+          }
+        };
+
+        const spawnStar = (canvasWidth) => {
+            const hasActiveStar = starsRef.current.some(s => s.active);
+            if (!hasActiveStar && Math.random() < 0.0008) {
+               const yPos = groundYRef.current - (60 + Math.random() * 100); 
+               starsRef.current.push({
+                   id: Date.now() + Math.random(),
+                   x: canvasWidth + 50,
+                   y: yPos,
+                   width: 30,
+                   height: 30,
+                   active: true,
+                   rotation: 0
+               });
+            }
+        };
+
+        const createExplosion = (x, y, color, count = 15) => {
+            for (let i = 0; i < count; i++) {
+                particlesRef.current.push({
+                    x: x,
+                    y: y,
+                    vx: (Math.random() - 0.5) * 12,
+                    vy: (Math.random() - 0.5) * 12,
+                    life: 1.0,
+                    color: color,
+                    size: Math.random() * 6 + 2
+                });
+            }
+        };
+
+        const updateGame = (timestamp, ctx, width, height) => {
+          if (gameState !== GameState.PLAYING) return;
+
+          frameCountRef.current++;
+          scoreRef.current += 1/60; 
+          const time = scoreRef.current;
+          const { colors } = getCurrentTheme(time);
+
+          // Speed Logic
+          let targetSpeed = CONFIG.baseSpeed;
+          if (time < 20) {
+              targetSpeed = 5 + (time / 20) * 2;
+          } else if (time < 40) {
+              targetSpeed = 8;
+          } else if (time < 60) {
+              targetSpeed = 8 + ((time - 40) / 20) * 3;
+          } else {
+              targetSpeed = 12 + ((time - 60) * 0.05); 
+          }
+          speedRef.current = speedRef.current * 0.95 + targetSpeed * 0.05;
+
+          // Physics
+          playerDyRef.current += CONFIG.gravity;
+          playerYRef.current += playerDyRef.current;
+
+          if (playerYRef.current > groundYRef.current) {
+              playerYRef.current = groundYRef.current;
+              playerDyRef.current = 0;
+              isJumpingRef.current = false;
+          }
+
+          const playerRect = {
+              x: 100 - PLAYER_DIMS.width / 2,
+              y: playerYRef.current - PLAYER_DIMS.height,
+              width: PLAYER_DIMS.width,
+              height: PLAYER_DIMS.height
+          };
+
+          // Invincibility
+          const now = Date.now();
+          const isInvincibleNow = now < invincibilityEndTimeRef.current;
+          if (isInvincible !== isInvincibleNow) {
+              setIsInvincible(isInvincibleNow);
+          }
+
+          // Obstacles
+          spawnObstacle(width);
+          for (let i = obstaclesRef.current.length - 1; i >= 0; i--) {
+              const obs = obstaclesRef.current[i];
+              obs.x -= speedRef.current;
+              
+              if (obs.type === 'GROUND') {
+                  obs.y = groundYRef.current - obs.height;
+              } else {
+                  obs.y = groundYRef.current - 110; // Trap
+              }
+
+              const hitX = obs.x + 5;
+              const hitY = obs.y + 5;
+              const hitW = obs.width - 10;
+              const hitH = obs.height - 10;
+
+              if (
+                  playerRect.x < hitX + hitW &&
+                  playerRect.x + playerRect.width > hitX &&
+                  playerRect.y < hitY + hitH &&
+                  playerRect.height + playerRect.y > hitY
+              ) {
+                  if (!isInvincibleNow) {
+                      audioManager.playCrash();
+                      createExplosion(playerRect.x, playerRect.y, colors.player, 30);
+                      setGameState(GameState.GAME_OVER);
+                      return;
+                  } 
+              }
+
+              if (obs.x + obs.width < -100) {
+                  obstaclesRef.current.splice(i, 1);
+              }
+          }
+
+          // Stars
+          spawnStar(width);
+          for (let i = starsRef.current.length - 1; i >= 0; i--) {
+              const star = starsRef.current[i];
+              star.x -= speedRef.current;
+              star.rotation += 0.05;
+
+              if (
+                  star.active &&
+                  playerRect.x < star.x + star.width &&
+                  playerRect.x + playerRect.width > star.x &&
+                  playerRect.y < star.y + star.height &&
+                  playerRect.height + playerRect.y > star.y
+              ) {
+                  star.active = false;
+                  invincibilityEndTimeRef.current = Date.now() + CONFIG.starDuration;
+                  audioManager.playCollect();
+                  createExplosion(star.x, star.y, COLORS.star);
+              }
+              if (star.x < -50) {
+                  starsRef.current.splice(i, 1);
+              }
+          }
+
+          // Particles
+          for (let i = particlesRef.current.length - 1; i >= 0; i--) {
+              const p = particlesRef.current[i];
+              p.x += p.vx;
+              p.y += p.vy;
+              p.life -= 0.02;
+              if (p.life <= 0) {
+                  particlesRef.current.splice(i, 1);
+              }
+          }
+
+          if (frameCountRef.current % 5 === 0) {
+              setScore(scoreRef.current);
+          }
+        };
+
+        const drawSamurai = (ctx, x, y, isRunning, isInvincible, themeColors) => {
+            ctx.save();
+            ctx.translate(x, y);
+
+            let fillColor = themeColors.player;
+            if (isInvincible) {
+                fillColor = themeColors.playerInvincible;
+                const timeLeft = invincibilityEndTimeRef.current - Date.now();
+                if (timeLeft < 5000) {
+                    if (Math.floor(Date.now() / 100) % 2 === 0) {
+                         ctx.globalAlpha = 0.5;
+                    }
+                }
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = themeColors.playerInvincible;
+            }
+
+            ctx.strokeStyle = fillColor;
+            ctx.fillStyle = fillColor;
+            ctx.lineWidth = 4;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+
+            // Head
+            ctx.beginPath();
+            ctx.arc(0, -50, 8, 0, Math.PI * 2); 
+            ctx.fill();
+
+            // Headband
+            ctx.lineWidth = 2;
+            const wind = isRunning ? Math.sin(Date.now() / 50) * 5 : 0;
+            ctx.beginPath();
+            ctx.moveTo(-6, -52); 
+            ctx.quadraticCurveTo(-20, -55 + wind, -30, -45 + wind);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(-6, -52);
+            ctx.quadraticCurveTo(-20, -50 + wind, -28, -58 + wind);
+            ctx.stroke();
+            ctx.lineWidth = 4;
+
+            // Body
+            ctx.beginPath();
+            ctx.moveTo(0, -42);
+            ctx.lineTo(0, -20);
+            ctx.stroke();
+
+            // Legs
+            const cycle = (Date.now() / 100 * (speedRef.current / 5)) % Math.PI;
+            const legOffset = isRunning ? Math.sin(cycle) * 12 : 0;
+
+            ctx.beginPath();
+            ctx.moveTo(0, -20);
+            ctx.lineTo(-8 + legOffset, -10);
+            ctx.lineTo(-4 + (legOffset * 1.5), 0);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(0, -20);
+            ctx.lineTo(8 - legOffset, -10);
+            ctx.lineTo(4 - (legOffset * 1.5), 0);
+            ctx.stroke();
+
+            // Arms
+            const armCycle = isRunning ? Math.cos(cycle) * 10 : 0;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(-2, -25);
+            ctx.lineTo(-20, -30);
+            ctx.stroke();
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(0, -38);
+            ctx.lineTo(-10 - armCycle, -20);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(0, -38);
+            ctx.lineTo(10 + armCycle, -20);
+            ctx.stroke();
+
+            ctx.restore();
+        };
+
+        const drawGame = (ctx, width, height, staticRender = false) => {
+            const { colors, t } = getCurrentTheme(scoreRef.current);
+
+            // Background
+            ctx.fillStyle = colors.background;
+            ctx.fillRect(0, 0, width, height);
+
+            // Sun (Day)
+            if (t < 1) {
+              const sunRadius = Math.min(width, height) * 0.25;
+              ctx.save();
+              ctx.globalAlpha = 1 - t; 
+              ctx.fillStyle = THEME.day.sun;
+              ctx.beginPath();
+              ctx.arc(width / 2, height * 0.6, sunRadius, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.restore();
+            }
+
+            // Moon (Night)
+            if (t > 0) {
+              const moonX = width / 2;
+              const moonY = height * 0.25;
+              const moonRadius = Math.min(width, height) * 0.1;
+              
+              ctx.save();
+              ctx.globalAlpha = t; 
+              
+              ctx.fillStyle = THEME.night.moon;
+              ctx.shadowBlur = 15;
+              ctx.shadowColor = THEME.night.moon;
+              ctx.beginPath();
+              ctx.arc(moonX, moonY, moonRadius, 0, Math.PI * 2);
+              ctx.fill();
+              
+              // Shadow (Crescent)
+              const shadowOffsetX = moonRadius * 0.3;
+              const shadowOffsetY = -moonRadius * 0.1;
+              
+              ctx.shadowBlur = 0;
+              ctx.fillStyle = colors.background; // Must match background
+              ctx.beginPath();
+              ctx.arc(moonX + shadowOffsetX, moonY + shadowOffsetY, moonRadius * 0.9, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.restore();
+            }
+
+            // Ground
+            ctx.fillStyle = colors.ground;
+            ctx.fillRect(0, groundYRef.current, width, height - groundYRef.current);
+            
+            ctx.strokeStyle = t > 0.5 ? '#a3a3a3' : '#44403c';
+            ctx.lineWidth = 3;
+            const groundOffset = staticRender ? 0 : (frameCountRef.current * speedRef.current) % 200;
+            for (let gx = -groundOffset; gx < width; gx += 200) {
+                ctx.beginPath();
+                ctx.moveTo(gx, groundYRef.current + 5);
+                ctx.lineTo(gx + 50, groundYRef.current + 15);
+                ctx.stroke();
+            }
+
+            // Obstacles
+            obstaclesRef.current.forEach(obs => {
+                if (obs.type === 'GROUND') {
+                  ctx.fillStyle = colors.obstacleGround;
+                  ctx.fillRect(obs.x, obs.y, obs.width, obs.height);
+                  ctx.fillStyle = colors.background;
+                  ctx.fillRect(obs.x + 5, obs.y + 5, 4, 4);
+                } else {
+                  ctx.fillStyle = colors.obstacleAir;
+                  ctx.shadowColor = colors.obstacleAir;
+                  ctx.shadowBlur = 10;
+                  ctx.fillRect(obs.x, obs.y, obs.width, obs.height);
+                  ctx.shadowBlur = 0;
+                  ctx.strokeStyle = t > 0.5 ? '#ef4444' : '#fca5a5';
+                  ctx.strokeRect(obs.x + 4, obs.y + 4, obs.width - 8, obs.height - 8);
+                }
+            });
+
+            // Stars
+            starsRef.current.forEach(star => {
+                if (!star.active) return;
+                ctx.save();
+                ctx.translate(star.x + star.width/2, star.y + star.height/2);
+                ctx.rotate(star.rotation);
+                ctx.fillStyle = COLORS.star;
+                ctx.beginPath();
+                for (let i = 0; i < 5; i++) {
+                   ctx.lineTo(Math.cos((18 + i * 72) * Math.PI / 180) * 15, 
+                              -Math.sin((18 + i * 72) * Math.PI / 180) * 15);
+                   ctx.lineTo(Math.cos((54 + i * 72) * Math.PI / 180) * 7, 
+                              -Math.sin((54 + i * 72) * Math.PI / 180) * 7);
+                }
+                ctx.closePath();
+                ctx.fill();
+                ctx.restore();
+            });
+
+            particlesRef.current.forEach(p => {
+                ctx.fillStyle = p.color;
+                ctx.globalAlpha = p.life;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+                ctx.fill();
+                ctx.globalAlpha = 1.0;
+            });
+
+            const isRunning = !isJumpingRef.current;
+            let isInvincibleDraw = invincibilityEndTimeRef.current > Date.now();
+            drawSamurai(ctx, 100, playerYRef.current, isRunning, isInvincibleDraw, colors);
+        };
+
+        const loop = useCallback((timestamp) => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+
+            if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+                groundYRef.current = canvas.height - CONFIG.groundHeight;
+            }
+
+            updateGame(timestamp, ctx, canvas.width, canvas.height);
+            drawGame(ctx, canvas.width, canvas.height);
+
+            if (gameState === GameState.PLAYING) {
+              requestRef.current = requestAnimationFrame(loop);
+            }
+        }, [gameState, setGameState, setScore, setIsInvincible, getCurrentTheme]);
+
+        useEffect(() => {
+            if (gameState === GameState.PLAYING) {
+                requestRef.current = requestAnimationFrame(loop);
+            }
+            return () => {
+                if (requestRef.current) cancelAnimationFrame(requestRef.current);
+            };
+        }, [gameState, loop]);
+
+        return (
+          <canvas ref={canvasRef} className="block w-full h-full" />
+        );
+      };
+
+      // --- COMPONENT: APP ---
+
+      function App() {
+        const [gameState, setGameState] = useState(GameState.START);
+        const [score, setScore] = useState(0);
+        const [isInvincible, setIsInvincible] = useState(false);
+        const [triggerJump, setTriggerJump] = useState(false);
+        const [highScore, setHighScore] = useState(() => {
+          const saved = localStorage.getItem('samuraiJump_highScore');
+          return saved ? parseFloat(saved) : 0;
+        });
+        
+        const [canRestart, setCanRestart] = useState(false);
+
+        useEffect(() => {
+            if (score > highScore) {
+              setHighScore(score);
+              localStorage.setItem('samuraiJump_highScore', score.toString());
+            }
+        }, [score, highScore]);
+
+        useEffect(() => {
+            if (gameState === GameState.GAME_OVER) {
+                setCanRestart(false);
+                const timer = setTimeout(() => setCanRestart(true), 1000);
+                return () => clearTimeout(timer);
+            } else if (gameState === GameState.START) {
+                setCanRestart(true);
+            }
+        }, [gameState]);
+
+        const handleJumpInput = useCallback(() => {
+          if (gameState === GameState.PLAYING) {
+            setTriggerJump(true);
+          } else if (gameState === GameState.START) {
+             setGameState(GameState.PLAYING);
+          } else if (gameState === GameState.GAME_OVER && canRestart) {
+             setGameState(GameState.START);
+          }
+        }, [gameState, canRestart]);
+
+        useEffect(() => {
+          const handleKeyDown = (e) => {
+            if (e.code === 'Space') {
+              handleJumpInput();
+            }
+          };
+          window.addEventListener('keydown', handleKeyDown);
+          return () => window.removeEventListener('keydown', handleKeyDown);
+        }, [handleJumpInput]);
+
+        const isNight = Math.floor(score / 60) % 2 !== 0;
+        const smoothTransition = {
+            transitionProperty: 'color, background-color, border-color',
+            transitionDuration: '5000ms',
+            transitionTimingFunction: 'linear'
+        };
+
+        return (
+          <div className="relative w-full h-screen overflow-hidden font-samurai select-none bg-stone-100">
+            <div className="absolute inset-0 z-0">
+              <GameCanvas 
+                gameState={gameState}
+                setGameState={setGameState}
+                setScore={setScore}
+                setIsInvincible={setIsInvincible}
+                isInvincible={isInvincible}
+                triggerJump={triggerJump}
+                onJumpHandled={() => setTriggerJump(false)}
+              />
+            </div>
+
+            <div className="absolute top-0 left-0 w-full p-6 flex justify-between items-start z-10 pointer-events-none">
+               <div className="flex flex-col gap-3">
+                  <div className="flex flex-col items-start">
+                     <div 
+                       className={`backdrop-blur-sm px-4 py-2 border-l-4 border-red-600 ${isNight ? 'bg-stone-900/50' : 'bg-stone-900/5'}`}
+                       style={smoothTransition}
+                     >
+                        <p className={`text-xs uppercase tracking-widest ${isNight ? 'text-stone-400' : 'text-stone-500'}`} style={smoothTransition}>
+                          Time
+                        </p>
+                        <p className={`text-4xl font-bold ${isNight ? 'text-stone-100' : 'text-stone-900'}`} style={smoothTransition}>
+                          {score.toFixed(1)}<span className="text-sm ml-1 font-normal">s</span>
+                        </p>
+                     </div>
+                  </div>
+                  
+                   <div className={`backdrop-blur-sm px-3 py-1 border-l-4 border-stone-400 ${isNight ? 'bg-stone-900/50' : 'bg-stone-900/5'}`} style={smoothTransition}>
+                       <p className={`text-xs ${isNight ? 'text-stone-300' : 'text-stone-600'}`} style={smoothTransition}>
+                          Best: {highScore.toFixed(1)}s
+                       </p>
+                   </div>
+
+                  {isInvincible && (
+                     <div className="animate-pulse bg-amber-500/90 text-white px-4 py-2 shadow-lg border border-amber-400 mt-2">
+                       <p className="text-sm uppercase font-bold tracking-widest">Invincible Mode</p>
+                     </div>
+                  )}
+               </div>
+            </div>
+
+            {gameState === GameState.START && (
+              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-stone-100/90 backdrop-blur-sm animate-fade-in">
+                 <div className="text-center space-y-8 max-w-md p-8 border-y-4 border-stone-900">
+                   <div>
+                     <h1 className="text-5xl md:text-7xl font-black text-stone-900 tracking-tighter">
+                       SAMURAI<br/><span className="text-red-600">JUMP</span>
+                     </h1>
+                   </div>
+                   <button 
+                     onClick={() => setGameState(GameState.PLAYING)}
+                     className="mt-8 px-10 py-4 bg-stone-900 hover:bg-red-700 text-stone-50 font-bold text-xl shadow-2xl transition-all border border-stone-900"
+                   >
+                     START RUN
+                   </button>
+                 </div>
+                 <p className="mt-8 text-stone-400 text-sm">Spacebar or Tap to Jump</p>
+              </div>
+            )}
+
+            {gameState === GameState.GAME_OVER && (
+              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-stone-900/90 backdrop-blur-md animate-in fade-in zoom-in duration-300">
+                 <div className="text-center space-y-8 p-10 bg-stone-100 border-4 border-red-600 shadow-2xl max-w-lg w-full mx-4">
+                   <h2 className="text-5xl font-black text-stone-900 uppercase">Defeated</h2>
+                   <div className="py-6 border-t border-b border-stone-200 space-y-2">
+                     <p className="text-stone-500 text-sm uppercase tracking-widest">Survival Time</p>
+                     <p className="text-6xl font-bold text-red-600">{score.toFixed(2)}s</p>
+                   </div>
+                   <button 
+                     onClick={() => { if(canRestart) setGameState(GameState.START); }}
+                     className={`w-full px-8 py-4 font-bold text-xl transition-all ${canRestart ? 'bg-stone-900 hover:bg-stone-800 text-white scale-100' : 'bg-stone-400 text-stone-200 cursor-not-allowed'}`}
+                     disabled={!canRestart}
+                   >
+                     {canRestart ? "TRY AGAIN" : "..."}
+                   </button>
+                 </div>
+              </div>
+            )}
+
+            <div className="absolute bottom-6 left-0 w-full px-6 flex justify-center z-10 pb-safe">
+              <button
+                className="w-full max-w-lg h-24 bg-red-700/90 backdrop-blur active:bg-red-600 rounded-sm shadow-[0_4px_0_rgb(69,10,10)] active:shadow-none active:translate-y-1 transition-all flex items-center justify-center group touch-manipulation border-2 border-red-800"
+                onPointerDown={(e) => {
+                    e.preventDefault(); 
+                    handleJumpInput();
+                }}
+              >
+                <span className="text-3xl font-serif font-bold text-white tracking-[0.2em] group-active:scale-95 transition-transform">JUMP</span>
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      // --- MOUNT ---
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(<App />);
+    </script>
   </body>
 </html>
